@@ -1,0 +1,450 @@
+import json
+import torch
+import numpy as np
+
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from poses.preprocessing import normalize_keypoints, threshold_confidence
+from poses.augmentation import augment_dvc_window
+from utils import parse_vtt
+from config import *
+
+
+class DVCDataset(Dataset):
+    def __init__(self, split, tokenizer, max_tries=10, noise_rate=0.15, pose_augment=False, stride_ratio=0.5, 
+                 min_events=1, max_events=10, max_event_tokens=20, max_window_tokens=128, load_by='window', seed=42):
+        '''
+        PyTorch Dataset for DVC with on-the-fly sliding window sampling.
+        Args:
+            split: 'train', 'val', or 'test'
+            tokenizer: HuggingFace tokenizer for text processing
+            max_tries: Max resamples for train windows with < min_events. Only used in train.
+            noise_rate: Probability of masking tokens in the paragraph during training, used for Contrastive Learning.
+            pose_augment: Whether to apply pose augmentation from GISLR competition's best solution (train only).
+            stride_ratio: For val/test sequential sampling (e.g., 0.5 for 50% overlap). Only used in val/test.
+            min_events: Min full events (subtitles) in a window
+            max_events: Max full events (subtitles) in a window
+            max_event_tokens: Max caption token length for padding/truncation
+            max_window_tokens: Max paragraph token length in a window for padding/truncation
+            load_by: 'window' (default) or 'video' - whether to
+                     load poses per window and concatenate or 
+                     load full video poses at once and slice
+            seed: For reproducibility in random sampling
+        '''
+        # assert split in ['train', 'val', 'test'], f"Split must be 'train', 'val', or 'test', but got {split}"
+        self.split = split
+        self.tokenizer = tokenizer
+        self.window_size_frames = int(WINDOW_DURATION_SECONDS * FPS)
+        
+        self.max_tries = max_tries
+        self.noise_rate = noise_rate
+        self.pose_augment = pose_augment if split == 'train' else False
+        self.stride = int(self.window_size_frames * stride_ratio)
+        
+        self.min_events = min_events
+        self.max_events = max_events
+        self.max_event_tokens = max_event_tokens
+        self.max_window_tokens = min(max_window_tokens, max_event_tokens * max_events) # Cap to avoid excessive lengths
+        self.load_by = load_by
+        assert self.load_by in ['window', 'video'], "load_by must be 'window' or 'video'"
+        
+        np.random.seed(seed)
+        self.video_ids = self.load_subset(split)
+        self.video_metadata = {} # Precomputed metadata per video for efficiency
+        self.eval_windows = [] # Store windows for val/test splits
+        self._build_video_metadata()
+        print(f'Dataset initialized for {split}: {len(self.video_ids)} videos')
+        print(f'Window size: {WINDOW_DURATION_SECONDS}s ({self.window_size_frames} frames @ {FPS} fps)')
+
+
+    @staticmethod
+    def load_subset(split): # Load the subset2episode.json to get train/val/test lists of video IDs
+        try:
+            with open(SUBSET_JSON, 'r') as f:
+                splits = json.load(f)
+        except FileNotFoundError:
+            print('Error: Metadata file not found at', SUBSET_JSON)
+            print('Please ensure the SUBSET_JSON path in config.py is correct.')
+
+        video_ids = splits.get(split, [])
+        if not video_ids: 
+            print(f'No videos found in {split} split.')
+            return []
+        print(f'Found {len(video_ids)} videos in the {split} split.')
+        return video_ids
+
+
+    def _build_video_metadata(self): # Precompute for sampling efficiency
+        for video_id in tqdm(self.video_ids, desc=f'Building video metadata for {self.split} split'):
+            pose_dir = POSE_ROOT / video_id
+            if not pose_dir.exists():
+                raise FileNotFoundError(f'Pose directory not found: {pose_dir}')
+
+            segment_paths = sorted(list(pose_dir.glob("*.npy")), key=lambda p: p.stem)
+            if not segment_paths: 
+                raise ValueError(f'No .npy files in {pose_dir}')
+
+            frame_counts = [np.load(f, mmap_mode='r').shape[0] for f in segment_paths]
+            total_frames = sum(frame_counts)
+            self.video_metadata[video_id] = {
+                'segment_paths': segment_paths,
+                'frame_counts': np.array(frame_counts),
+                'total_frames': total_frames,
+                'cumulative_frames': np.cumsum([0] + frame_counts),
+                'subtitles': parse_vtt(VTT_DIR / f'{video_id}.vtt')
+            }
+            if self.split != 'train': # For val/test: count fixed, overlapping windows
+                for window_start_frame in range(0, total_frames, self.stride):
+                    window_end_frame = window_start_frame + self.window_size_frames
+                    
+                    if window_end_frame <= total_frames: # Ignore the last, smaller window if it's too short
+                        valid_events_count = 0 # Count valid events fully contained in a window (used for val filtering)
+                        for sub in self.video_metadata[video_id]['subtitles']:
+                            sub_start_frame = int(sub['start'] * FPS)
+                            sub_end_frame = int(sub['end'] * FPS)
+                            if sub_start_frame >= window_start_frame and sub_end_frame <= window_end_frame and \
+                                MIN_SUB_DURATION <= sub['duration'] <= MAX_SUB_DURATION:
+                                valid_events_count += 1
+                                
+                        if valid_events_count < self.min_events or valid_events_count > self.max_events: continue
+                        self.eval_windows.append({
+                            'video_id': video_id,
+                            'window_start_frame': window_start_frame,
+                            'window_end_frame': window_end_frame
+                        })
+
+    def __len__(self):
+        if self.split == 'train': return len(self.video_metadata) # For train: One per video (sampling random per getitem call)
+        return len(self.eval_windows) # For val/test: Number of sequential windows across all videos
+        # eval_window_count = 0
+        # for video_id in self.video_ids:
+        #     total_frames = self.video_metadata[video_id]['total_frames']
+        #     eval_window_count += max(1, (total_frames - self.window_size_frames) // self.stride + 1)
+        # return eval_window_count
+            
+    
+    def __getitem__(self, idx):
+        # --- Random Sampling for Training ---
+        if self.split == 'train': # idx is video index; sample random window
+            video_id = self.video_ids[idx]
+            max_start_frame = self.video_metadata[video_id]['total_frames'] - self.window_size_frames
+            
+            if max_start_frame <= 0: # Video shorter than window: take whole video (will be padded later)
+                return self._get_window_data(video_id, 0, self.video_metadata[video_id]['total_frames'])
+            
+            # Randomly select a start frame for the window
+            for try_num in range(self.max_tries):
+                window_start_frame = np.random.randint(0, max_start_frame)
+                window_end_frame = window_start_frame + self.window_size_frames
+                
+                window = self._get_window_data(video_id, window_start_frame, window_end_frame)
+                if self.min_events <= window[-1]['class_labels'].shape[0] <= self.max_events: # Check events
+                    # print(f'Sampled valid window for {video_id} (try {try_num+1})')
+                    return window
+                
+            print(f"Warning: Can't find window with {self.min_events} <= events <= {self.max_events} for {video_id} after {self.max_tries} tries\n"
+                  f"=> Fallback: pick a window that guarantees events within [{self.min_events}, {self.max_events}] if possible, "
+                  f"otherwise the closest window to this range within window size.")
+            fallback_start, fallback_end = self._sample_densest_window(video_id)
+            return self._get_window_data(video_id, fallback_start, fallback_end)
+
+        # --- Fixed Window for Evaluation ---
+        else: # idx is global window index; find corresponding video_id and local window
+            # cum_windows = 0
+            # for video_id in self.video_ids:
+            #     total_frames = self.video_metadata[video_id]['total_frames']
+            #     num_windows = max(1, (total_frames - self.window_size_frames) // self.stride + 1)
+
+            #     if idx < cum_windows + num_windows:
+            #         local_idx = idx - cum_windows
+            #         window_start_frame = local_idx * self.stride
+            #         window_end_frame = window_start_frame + self.window_size_frames
+            #         window = self._get_window_data(video_id, window_start_frame, window_end_frame)
+            #         # print(f'Fixed window {local_idx}/{num_windows} for {video_id}')
+            #         return window
+            #     cum_windows += num_windows
+            # raise IndexError('Invalid idx for val/test')
+            eval_window = self.eval_windows[idx]
+            return self._get_window_data(
+                eval_window['video_id'],
+                eval_window['window_start_frame'],
+                eval_window['window_end_frame']
+            )
+            
+
+    def _get_window_data(self, video_id, window_start_frame, window_end_frame):
+        if window_start_frame >= window_end_frame: raise ValueError('Invalid window boundaries')
+        if self.load_by == 'video': # Load full video poses at once and slice
+            full_poses = self.load_poses_for_video(video_id)
+            window_poses = full_poses[window_start_frame:window_end_frame, :, :]
+        elif self.load_by == 'window': # Load only the necessary segments for this window and concatenate
+            window_poses = self.load_poses_for_window(video_id, window_start_frame, window_end_frame)
+
+        if self.pose_augment: # Apply before normalization so flip/affine operate in pixel space (train-only)
+            window_poses = np.asarray(window_poses, dtype=np.float32)
+            window_poses = augment_dvc_window(window_poses)
+        
+        # Preprocess poses: Normalize and threshold
+        window_poses = normalize_keypoints(window_poses)
+        window_poses = threshold_confidence(window_poses)
+
+        # Crop/pad to fixed window size if needed and build a frame mask
+        orig_len = int(window_poses.shape[0])
+        if orig_len > self.window_size_frames:
+            window_poses = window_poses[: self.window_size_frames]
+            frame_mask = torch.ones(self.window_size_frames, dtype=torch.bool)
+            orig_len = self.window_size_frames
+        elif orig_len < self.window_size_frames:
+            pad_len = self.window_size_frames - orig_len
+            pad = np.zeros((pad_len, window_poses.shape[1], window_poses.shape[2]), dtype=window_poses.dtype)
+            window_poses = np.concatenate([window_poses, pad], axis=0)
+            frame_mask = torch.cat([torch.ones(orig_len, dtype=torch.bool), torch.zeros(pad_len, dtype=torch.bool)], dim=0)
+        else:
+            frame_mask = torch.ones(self.window_size_frames, dtype=torch.bool)
+
+        # Filter subtitles in window and build model-ready labels
+        labels = {'class_labels': [], 'boxes': [], 'seq_tokens': [], 'paragraph_tokens': '', 'masked_paragraph_tokens': ''}
+        for sub in self.video_metadata[video_id]['subtitles']:
+            if len(labels['class_labels']) >= self.max_events: break # Truncate to max_events
+            sub_start_frame = int(sub['start'] * FPS)
+            sub_end_frame = int(sub['end'] * FPS)
+
+            # Subtitle must be FULLY contained within the window and have valid duration
+            if sub_start_frame >= window_start_frame and sub_end_frame <= window_end_frame and \
+                MIN_SUB_DURATION <= sub['duration'] <= MAX_SUB_DURATION: 
+                # Normalize to [0, 1] relative to window
+                rel_start = (sub_start_frame - window_start_frame) / self.window_size_frames
+                rel_end = (sub_end_frame - window_start_frame) / self.window_size_frames
+                center = min(max(0.5 * (rel_start + rel_end), 0.0), 1.0)
+                width = min(max(rel_end - rel_start, 0.0), 1.0)
+                labels['class_labels'].append(0) # Default single class 0
+                labels['boxes'].append([center, width])
+                labels['seq_tokens'].append(sub['text'])
+        
+        # Paragraph-level input to train non-streaming models in a streaming manner, with masking support for contrastive learning
+        if labels['seq_tokens']: # At least 1 valid subtitle in window
+            labels['paragraph_tokens'] = ' '.join(labels['seq_tokens'])  # Concatenate all subtitles into a single paragraph
+            if self.split == 'train' and np.random.uniform(0, 1) <= 1.0: # Apply noise injection only during training
+                labels['masked_paragraph_tokens'] = ' '.join([
+                    self.tokenizer.mask_token if np.random.uniform(0, 1) < self.noise_rate else word 
+                    for word in labels['paragraph_tokens'].split()
+                ])
+            else: labels['masked_paragraph_tokens'] = labels['paragraph_tokens']
+        
+        # Convert to tensors
+        if labels['class_labels']:
+            labels['class_labels'] = torch.tensor(labels['class_labels'], dtype=torch.long)
+            labels['boxes'] = torch.tensor(labels['boxes'], dtype=torch.float)
+            labels['seq_tokens'] = self.tokenizer(
+                labels['seq_tokens'], add_special_tokens=True, truncation=True, 
+                padding='max_length', max_length=self.max_event_tokens, return_tensors='pt'
+            )['input_ids']
+            
+            # Paragraph-level tokenization
+            labels['paragraph_tokens'] = self.tokenizer(
+                labels['paragraph_tokens'], add_special_tokens=True, truncation=True,
+                padding='max_length', max_length=self.max_window_tokens, return_tensors='pt'
+            )['input_ids'].squeeze(0) # Remove batch dim
+            labels['masked_paragraph_tokens'] = self.tokenizer(
+                labels['masked_paragraph_tokens'], add_special_tokens=True, truncation=True,
+                padding='max_length', max_length=self.max_window_tokens, return_tensors='pt'
+            )['input_ids'].squeeze(0) # Remove batch dim
+
+        else: # No valid subtitles in window
+            labels['class_labels'] = torch.empty(0, dtype=torch.long)
+            labels['boxes'] = torch.empty(0, 2, dtype=torch.float)
+            labels['seq_tokens'] = torch.empty(0, self.max_event_tokens, dtype=torch.long)
+            labels['paragraph_tokens'] = torch.empty(self.max_window_tokens, dtype=torch.long)
+            labels['masked_paragraph_tokens'] = torch.empty(self.max_window_tokens, dtype=torch.long)
+
+        poses_tensor = torch.from_numpy(window_poses).float()  # (T, K, 3)
+        return video_id, window_start_frame, window_end_frame, poses_tensor, frame_mask, labels
+    
+    
+    def _sample_densest_window(self, video_id):
+        ''' Fallback sampler:
+        - Prefer windows that fully contain events within [min_events, max_events] range.
+        - If none exist, pick the window closest to this range within window size.
+        - As a last resort, fall back to a random/edge window.
+        Returns (start_frame, end_frame).
+        '''
+        total = self.video_metadata[video_id]['total_frames']
+        max_start_frame = max(0, total - self.window_size_frames)
+
+        events = [] # Collect valid events (consistent with label filtering)
+        for sub in self.video_metadata[video_id]['subtitles']:
+            if MIN_SUB_DURATION <= sub['duration'] <= MAX_SUB_DURATION:
+                sub_start_frame = int(sub['start'] * FPS)
+                sub_end_frame = int(sub['end'] * FPS)
+                # Clamp to video bounds
+                sub_start_frame = max(0, min(sub_start_frame, total))
+                sub_end_frame = max(0, min(sub_end_frame, total))
+                if sub_end_frame > sub_start_frame: events.append((sub_start_frame, sub_end_frame))
+
+        if not events: # No valid events -> random window (or whole video if shorter than window_size_frames)
+            if max_start_frame > 0:
+                start = np.random.randint(0, max_start_frame + 1)
+                return start, start + self.window_size_frames
+            return 0, total  # short video
+
+        events.sort(key=lambda x: x[0])
+        num_events = len(events)
+
+        # Two-pointer sweep to find clusters fitting within window_size_frames
+        j, candidates = 0, [] # ranges [low, high] of valid window_start ensuring full containment
+        best_count, best_range, best_distance = 0, None, float('inf')  # Distance from valid range [min_events, max_events]
+        
+        for i in range(num_events):
+            if j < i: j = i
+            while j < num_events and (events[j][1] - events[i][0]) <= self.window_size_frames:  
+                j += 1 # Expand j while the span fits within window size
+                
+            j_valid = j - 1 # Last index that still fits
+            if j_valid >= i:
+                count = j_valid - i + 1
+                
+                # Valid start range so that [start, start + window_size_frames] fully contains [events[i].start, events[j_valid].end]
+                low = max(0, events[j_valid][1] - self.window_size_frames)
+                high = min(events[i][0], max_start_frame)
+                if low <= high: # Valid range
+                    if self.min_events <= count <= self.max_events: candidates.append((low, high))
+                    
+                    # Track best range closest to [min_events, max_events]
+                    if count < self.min_events: distance = self.min_events - count
+                    elif count > self.max_events: distance = count - self.max_events
+                    else: distance = 0
+                    
+                    # Prefer ranges with more events if distances are equal
+                    if distance < best_distance or (distance == best_distance and count > best_count):
+                        best_count, best_range, best_distance = count, (low, high), distance
+        
+        if candidates: # Prefer any range that yields events within [min_events, max_events]
+            low, high = candidates[np.random.randint(0, len(candidates))]
+            start = low if high <= low else np.random.randint(low, high + 1)
+            return start, start + self.window_size_frames
+
+        if best_range is not None: # Otherwise, take the cluster closest to valid range
+            low, high = best_range
+            start = low if high <= low else np.random.randint(low, high + 1)
+            return start, start + self.window_size_frames
+
+        if max_start_frame > 0: # If no cluster fits (e.g., all events longer than window_size_frames), fall back to random/edge
+            start = np.random.randint(0, max_start_frame + 1)
+            return start, start + self.window_size_frames
+        return 0, total
+    
+        
+    def load_poses_for_video(self, video_id: str) -> np.ndarray:
+        '''
+        Load all .npy segments for a video, concatenate into 1 array.
+        Uses memmap for efficiency on large videos.
+        Returns np.array (total_frames, 133, 3)
+        '''
+        # segment_shapes = []
+        pose_segments = []
+        
+        for seg_path in self.video_metadata[video_id]['segment_paths']:
+            seg = np.load(seg_path, mmap_mode='r')
+            # segment_shapes.append(seg.shape[0])
+            # seg = np.load(seg_path)
+            pose_segments.append(seg)
+        full_poses = np.concatenate(pose_segments, axis=0)
+        
+        # Concatenate using memmap views
+        # offset = 0
+        # full_poses = np.empty((self.video_metadata[video_id][total_frames], 133, 3), dtype=np.float32)
+        # for i, seg_path in enumerate(self.video_metadata[video_id]['segment_paths']):
+        #     seg = np.load(seg_path, mmap_mode='r')
+        #     full_poses[offset:offset + segment_shapes[i]] = seg
+        #     offset += segment_shapes[i]
+        
+        print(f'Loaded poses for {video_id}: {full_poses.shape} from {len(pose_segments)} segments')
+        return full_poses
+
+
+    def load_poses_for_window(self, video_id: str, window_start_frame: int, window_end_frame: int) -> np.ndarray:
+        '''
+        Load all .npy segments for a given window, concatenate into 1 array.
+        Returns np.array (total_frames, 133, 3)
+        '''
+        pose_segments = []
+        cumulative_frames = self.video_metadata[video_id]['cumulative_frames']
+        
+        # Find which npy files this window intersects with
+        start_file_idx = np.searchsorted(cumulative_frames, window_start_frame, side='right') - 1
+        end_file_idx = np.searchsorted(cumulative_frames, window_end_frame - 1, side='right') - 1
+
+        for i in range(start_file_idx, end_file_idx + 1):
+            local_start = max(0, window_start_frame - cumulative_frames[i])
+            local_end = min(self.video_metadata[video_id]['frame_counts'][i], window_end_frame - cumulative_frames[i])
+            seg = np.load(self.video_metadata[video_id]['segment_paths'][i], mmap_mode='r')
+            pose_segments.append(seg[local_start:local_end])
+        return np.concatenate(pose_segments, axis=0)
+        
+
+def collate_fn(batch):
+    '''
+    Collate for variable lengths: Stack poses, list others.
+    Fixed window_size, so no padding needed for poses.
+    '''
+    video_ids, window_start_frames, window_end_frames, poses_tensor, frame_masks, labels = zip(*batch)
+    T = poses_tensor[0].shape[0]
+    assert all(p.shape[0] == T for p in poses_tensor), 'Variable T in batch; use batch_size=1 or add padding.'
+    return {
+        'video_ids': video_ids,
+        'window_start_frames': window_start_frames,
+        'window_end_frames': window_end_frames,
+        'pixel_values': torch.stack(poses_tensor), # [B(N), T, 77(K), 3(C)] Channel-last for CoSign backbone
+        'pixel_mask': torch.stack(frame_masks),    # True for real frames, False for padding
+        'labels': labels # List of dicts (includes 'frame_mask')
+    }
+    
+
+def trainer_collate_fn(batch):
+    _, _, _, poses_tensor, frame_masks, labels = zip(*batch)
+    T = poses_tensor[0].shape[0]
+    assert all(p.shape[0] == T for p in poses_tensor), 'Variable T in batch; use batch_size=1 or add padding.'
+    return {
+        'pixel_values': torch.stack(poses_tensor), # [B(N), T, 77(K), 3(C)] Channel-last for CoSign backbone
+        'pixel_mask': torch.stack(frame_masks),    # True for real frames, False for padding
+        'labels': labels # List of dicts (includes 'frame_mask')
+    }
+
+
+def get_loader(
+    split, tokenizer, batch_size=32, max_tries=10, noise_rate=0.15, pose_augment=False, stride_ratio=0.5, 
+    min_events=1, max_events=10, max_event_tokens=20, max_window_tokens=128, load_by='window', seed=42
+):
+    dataset = DVCDataset( # Create a data loader for a specific split
+        split=split, tokenizer=tokenizer, max_tries=max_tries, 
+        noise_rate=noise_rate, pose_augment=pose_augment, stride_ratio=stride_ratio, 
+        min_events=min_events, max_events=max_events, max_event_tokens=max_event_tokens, 
+        max_window_tokens=max_window_tokens, load_by=load_by, seed=seed
+    )
+    return DataLoader(
+        dataset, batch_size=batch_size,
+        shuffle=True if split == 'train' else False, num_workers=2,
+        pin_memory=True, collate_fn=collate_fn
+    )
+    
+    
+if __name__ == '__main__':
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained('captioners/trimmed_tokenizer')
+    train_loader = get_loader('train', tokenizer=tokenizer, batch_size=4)
+    
+    for batch in train_loader:
+        video_ids, start_frames, end_frames = batch['video_ids'], batch['window_start_frames'], batch['window_end_frames']
+        poses, pixel_mask, labels = batch['pixel_values'], batch['pixel_mask'], batch['labels']
+        print('Batch poses shape: ', poses.shape)
+        
+        for video_id, start_frame, end_frame, events in zip(video_ids, start_frames, end_frames, labels):
+            print(f'\nVIDEO ID: {video_id}, Start Frame: {start_frame}, End Frame: {end_frame}')
+            print(f"- Window Paragraph: {tokenizer.decode(events['paragraph_tokens'])}")
+            print(f"- Masked Paragraph: {tokenizer.decode(events['masked_paragraph_tokens'])}")
+            
+            for i, (box, event_tokens) in enumerate(zip(events['boxes'], events['seq_tokens'])):
+                print(f'\n[Event {i + 1}] center={box[0]:.3f}, width={box[1]:.3f}, caption length={event_tokens.shape}:'
+                      f'\n=> Tokens: {event_tokens.tolist()}'
+                      f"\n=> Text: {tokenizer.decode(event_tokens)}")
+        break
