@@ -20,7 +20,7 @@ tokenizer = AutoTokenizer.from_pretrained('facebook/mbart-large-cc25', src_lang=
 tt = TokenizerTrimmer(tokenizer)
 tt.make_vocab(subtitles)
 tt.make_tokenizer()
-tt.trimmed_tokenizer.save_pretrained('./captioners/trimmed_tokenizer')
+tt.trimmed_tokenizer.save_pretrained('./captioners/trimmed_mbart')
 
 # with open('./captioners/trimmed_tokenizer/trimmed_vocab_ids.txt', 'w') as f:
 #     for tok_id in tt.trimmed_vocab_ids: 

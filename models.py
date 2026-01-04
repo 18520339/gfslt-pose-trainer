@@ -5,7 +5,7 @@
 
 References:
 - GFSLT-VLP: https://github.com/zhoubenjia/GFSLT-VLP
-- CoSign: https://arxiv.org/abs/2405.05356
+- CoSign: https://openaccess.thecvf.com/content/ICCV2023/papers/Jiao_CoSign_Exploring_Co-occurrence_Signals_in_Skeleton-based_Continuous_Sign_Language_Recognition_ICCV_2023_paper.pdf
 '''
 import torch
 import torch.nn as nn
@@ -34,11 +34,7 @@ class GFSLTConfig:
     temporal_kernel: int = 3
     mask_ratio: float = 0.3
     logit_scale_init: float = 0.07
-    
-    # MBart configuration
-    mbart_name: str = 'facebook/mbart-large-cc25'
-    src_lang: str = 'en_XX'
-    tgt_lang: str = 'en_XX'
+    mbart_name: str = './trimmed_mbart'
     
     # Training
     noise_rate: float = 0.15
