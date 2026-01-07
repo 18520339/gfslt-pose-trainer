@@ -173,7 +173,7 @@ def train_stage1(model_args: ModelArguments, data_args: DataArguments, training_
         mlm_loss_weight=model_args.mlm_loss_weight,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
-    train_result = trainer.train()
+    trainer.train()
     trainer.save_model()
 
 
