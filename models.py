@@ -32,7 +32,6 @@ class GFSLTConfig:
     embed_dim: int = 1024
     hidden_size: int = 1024
     temporal_kernel: int = 3
-    mask_ratio: float = 0.3
     logit_scale_init: float = 0.07
     mbart_name: str = './trimmed_mbart'
     
@@ -89,7 +88,7 @@ class PoseFeatureExtractor(nn.Module):
         self.config = config
         self.cosign = CoSign1s( # Use CoSign backbone for pose feature extraction
             temporal_kernel=config.temporal_kernel, hidden_size=config.hidden_size,
-            level=level, adaptive=adaptive, mask_ratio=config.mask_ratio
+            level=level, adaptive=adaptive
         )
         if use_temporal_conv:
             self.temporal_conv = TemporalConv1D(input_size=config.hidden_size, hidden_size=config.embed_dim, conv_type=2)

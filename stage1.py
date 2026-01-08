@@ -25,7 +25,6 @@ class ModelArguments:
     embed_dim: int = field(default=1024, metadata={'help': 'Embedding dimension'})
     hidden_size: int = field(default=1024, metadata={'help': 'Hidden size'})
     temporal_kernel: int = field(default=3, metadata={'help': 'Temporal kernel size for CoSign'})
-    mask_ratio: float = field(default=0.3, metadata={'help': 'Mask ratio for CoSign'})
     mbart_name: str = field(default='trimmed_mbart', metadata={'help': 'MBart model name'})
     noise_rate: float = field(default=0.15, metadata={'help': 'Noise rate for masked LM'})
     label_smoothing: float = field(default=0.2, metadata={'help': 'Label smoothing'})
@@ -42,7 +41,7 @@ class DataArguments:
     min_events: int = field(default=1, metadata={'help': 'Minimum number of events in a window'})
     max_events: int = field(default=10, metadata={'help': 'Maximum number of events in a window'})
     max_event_tokens: int = field(default=40, metadata={'help': 'Maximum number of tokens per event/caption'})
-    max_window_tokens: int = field(default=128, metadata={'help': 'Maximum number of tokens in a window for non-streaming input'})
+    max_window_tokens: int = field(default=256, metadata={'help': 'Maximum number of tokens in a window for non-streaming input'})
     load_by: str = field(default='window', metadata={'help': "Load data by 'window' or by 'video'"})
     
     
@@ -152,7 +151,6 @@ def train_stage1(model_args: ModelArguments, data_args: DataArguments, training_
         embed_dim=model_args.embed_dim,
         hidden_size=model_args.hidden_size,
         temporal_kernel=model_args.temporal_kernel,
-        mask_ratio=model_args.mask_ratio,
         mbart_name=model_args.mbart_name,
         noise_rate=model_args.noise_rate,
         label_smoothing=model_args.label_smoothing,
