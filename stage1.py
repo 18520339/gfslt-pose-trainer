@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
-from transformers import Trainer, TrainingArguments, AutoTokenizer, HfArgumentParser, EarlyStoppingCallback
+from transformers import Trainer, TrainingArguments, AutoTokenizer, HfArgumentParser
 
 import sys
 from pathlib import Path
@@ -65,17 +65,11 @@ class CustomTrainingArguments(TrainingArguments):
     ddp_find_unused_parameters: bool = field(default=False, metadata={'help': 'Avoid DDP overhead if all parameters are used'})
     max_grad_norm: float = field(default=1.0, metadata={'help': 'Gradient clipping to avoid exploding gradients'})
     
-    # Reporting
+    # Reporting and saving
     report_to: Optional[str] = field(default='none', metadata={'help': 'Whether to report to wandb/tensorboard/none'})
     logging_strategy: str = field(default='epoch')
-    eval_strategy: str = field(default='epoch', metadata={'help': 'Evaluate after each epoch'})
-    
-    # Saving
     save_strategy: str = field(default='epoch')
     save_total_limit: Optional[int] = field(default=1)
-    metric_for_best_model: Optional[str] = field(default='eval_loss', metadata={'help': 'Use validation loss for early stopping'})
-    greater_is_better: Optional[bool] = field(default=False, metadata={'help': 'Lower loss is better'})
-    load_best_model_at_end: bool = field(default=True, metadata={'help': 'Load the best model based on validation loss'})
     
 
 # ======================== Custom Trainer for Stage 1 VLP Training ========================
@@ -142,14 +136,8 @@ def train_stage1(model_args: ModelArguments, data_args: DataArguments, training_
         min_events=data_args.min_events, max_events=data_args.max_events, max_window_tokens=data_args.max_window_tokens, 
         max_event_tokens=data_args.max_event_tokens, load_by=data_args.load_by, seed=training_args.seed
     )
-    val_dataset = DVCDataset(
-        split='val', tokenizer=tokenizer, pose_augment=False, stride_ratio=data_args.stride_ratio, 
-        min_events=data_args.min_events, max_events=data_args.max_events, max_event_tokens=data_args.max_event_tokens, 
-        max_window_tokens=data_args.max_window_tokens, load_by=data_args.load_by, seed=training_args.seed
-    )
     if getattr(training_args, 'local_rank', -1) in (-1, 0): # Only log sizes on the main process to avoid clutter in DDP
         print(f'Train dataset: {len(train_dataset)} samples')
-        # print(f'Val dataset: {len(val_dataset)} samples')
     
     # Model Setup
     config = GFSLTConfig(
@@ -169,11 +157,9 @@ def train_stage1(model_args: ModelArguments, data_args: DataArguments, training_
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
         data_collator=trainer_collate_fn,
         text_decoder=TextDecoder(config) if model_args.use_text_decoder else None,
         mlm_loss_weight=model_args.mlm_loss_weight,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
     trainer.train()
     trainer.save_model()
