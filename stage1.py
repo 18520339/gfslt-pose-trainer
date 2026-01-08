@@ -26,7 +26,7 @@ class ModelArguments:
     hidden_size: int = field(default=1024, metadata={'help': 'Hidden size'})
     temporal_kernel: int = field(default=3, metadata={'help': 'Temporal kernel size for CoSign'})
     mask_ratio: float = field(default=0.3, metadata={'help': 'Mask ratio for CoSign'})
-    mbart_name: str = field(default='facebook/mbart-large-cc25', metadata={'help': 'MBart model name'})
+    mbart_name: str = field(default='trimmed_mbart', metadata={'help': 'MBart model name'})
     noise_rate: float = field(default=0.15, metadata={'help': 'Noise rate for masked LM'})
     label_smoothing: float = field(default=0.2, metadata={'help': 'Label smoothing'})
     use_text_decoder: bool = field(default=True, metadata={'help': 'Whether to use text decoder for MLM'})

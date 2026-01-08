@@ -20,9 +20,9 @@ tokenizer = AutoTokenizer.from_pretrained('facebook/mbart-large-cc25', src_lang=
 tt = TokenizerTrimmer(tokenizer)
 tt.make_vocab(subtitles)
 tt.make_tokenizer()
-tt.trimmed_tokenizer.save_pretrained('./captioners/trimmed_mbart')
+tt.trimmed_tokenizer.save_pretrained('trimmed_mbart')
 
-# with open('./captioners/trimmed_tokenizer/trimmed_vocab_ids.txt', 'w') as f:
+# with open('trimmed_tokenizer/trimmed_vocab_ids.txt', 'w') as f:
 #     for tok_id in tt.trimmed_vocab_ids: 
 #         f.write(f'{tok_id}\n')
 
@@ -31,4 +31,4 @@ model = MBartForConditionalGeneration.from_pretrained('facebook/mbart-large-cc25
 mt = MBartTrimmer(model, model.config, tt.trimmed_tokenizer)
 mt.make_weights(tt.trimmed_vocab_ids)
 mt.make_model()
-mt.trimmed_model.save_pretrained('./captioners/trimmed_mbart')
+mt.trimmed_model.save_pretrained('trimmed_mbart')
