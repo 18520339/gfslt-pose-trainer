@@ -28,15 +28,12 @@ from backbones.cosign import CoSign1s
 # ======================== Configuration Dataclass ========================
 @dataclass
 class GFSLTConfig:
-    # Model architecture
+    # Model Setup
     embed_dim: int = 1024
     hidden_size: int = 1024
     temporal_kernel: int = 3
     logit_scale_init: float = 0.07
     mbart_name: str = './trimmed_mbart'
-    
-    # Training
-    noise_rate: float = 0.15
     label_smoothing: float = 0.2
     
     # Pose input dimensions (from config.py)
@@ -90,7 +87,8 @@ class PoseFeatureExtractor(nn.Module):
             temporal_kernel=config.temporal_kernel, hidden_size=config.hidden_size,
             level=level, adaptive=adaptive
         )
-        if use_temporal_conv:
+        self.use_temporal_conv = use_temporal_conv
+        if self.use_temporal_conv:
             self.temporal_conv = TemporalConv1D(input_size=config.hidden_size, hidden_size=config.embed_dim, conv_type=2)
     
     def forward(self, poses: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -243,8 +241,8 @@ class SLRCLIP(nn.Module):
         # Compute contrastive loss using KL Divergence
         probs_per_image = F.log_softmax(logits_per_image, dim=1)
         probs_per_text = F.log_softmax(logits_per_text, dim=1)
-        loss_img = F.kl_div(probs_per_image, probs_ground_truth)
-        loss_txt = F.kl_div(probs_per_text, probs_ground_truth)
+        loss_img = F.kl_div(probs_per_image, probs_ground_truth, reduction='batchmean')
+        loss_txt = F.kl_div(probs_per_text, probs_ground_truth, reduction='batchmean')
         return {
             'loss': (loss_img + loss_txt) / 2.0,
             'logits_per_image': logits_per_image,
