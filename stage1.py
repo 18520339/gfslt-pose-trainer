@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
-from transformers import Trainer, TrainingArguments, AutoTokenizer, HfArgumentParser
+from transformers import Trainer, TrainingArguments, AutoTokenizer, HfArgumentParser, EarlyStoppingCallback
 
 import sys
 from pathlib import Path
@@ -26,7 +26,6 @@ class ModelArguments:
     hidden_size: int = field(default=1024, metadata={'help': 'Hidden size'})
     temporal_kernel: int = field(default=3, metadata={'help': 'Temporal kernel size for CoSign'})
     mbart_name: str = field(default='trimmed_mbart', metadata={'help': 'MBart model name'})
-    noise_rate: float = field(default=0.15, metadata={'help': 'Noise rate for masked LM'})
     label_smoothing: float = field(default=0.2, metadata={'help': 'Label smoothing'})
     use_text_decoder: bool = field(default=True, metadata={'help': 'Whether to use text decoder for MLM'})
     mlm_loss_weight: float = field(default=1.0, metadata={'help': 'Weight for masked LM loss'})
@@ -66,11 +65,17 @@ class CustomTrainingArguments(TrainingArguments):
     ddp_find_unused_parameters: bool = field(default=False, metadata={'help': 'Avoid DDP overhead if all parameters are used'})
     max_grad_norm: float = field(default=1.0, metadata={'help': 'Gradient clipping to avoid exploding gradients'})
     
-    # Reporting and saving
+    # Reporting
     report_to: Optional[str] = field(default='none', metadata={'help': 'Whether to report to wandb/tensorboard/none'})
     logging_strategy: str = field(default='epoch')
+    eval_strategy: str = field(default='epoch', metadata={'help': 'Evaluate after each epoch'})
+    
+    # Saving
     save_strategy: str = field(default='epoch')
     save_total_limit: Optional[int] = field(default=1)
+    metric_for_best_model: Optional[str] = field(default='eval_loss', metadata={'help': 'Use validation loss for early stopping'})
+    greater_is_better: Optional[bool] = field(default=False, metadata={'help': 'Lower loss is better'})
+    load_best_model_at_end: bool = field(default=True, metadata={'help': 'Load the best model based on validation loss'})
     
 
 # ======================== Custom Trainer for Stage 1 VLP Training ========================
@@ -103,7 +108,7 @@ class Stage1Trainer(Trainer): # Handles CLIP-style contrastive loss + optional m
         total_loss = outputs['loss']
         
         # Add masked LM loss if text decoder is available
-        if self.text_decoder is not None and self.training:
+        if self.text_decoder is not None and model.training:
             masked_paragraph_tokens = torch.stack([l['masked_paragraph_tokens'] for l in labels]).to(device)
             masked_paragraph_attention_mask = (masked_paragraph_tokens != pad_token_id).long()
             with torch.no_grad(): # Get encoder hidden states from text encoder
@@ -152,7 +157,6 @@ def train_stage1(model_args: ModelArguments, data_args: DataArguments, training_
         hidden_size=model_args.hidden_size,
         temporal_kernel=model_args.temporal_kernel,
         mbart_name=model_args.mbart_name,
-        noise_rate=model_args.noise_rate,
         label_smoothing=model_args.label_smoothing,
     )
     slrclip = SLRCLIP(config)
