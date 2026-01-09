@@ -1,18 +1,13 @@
 # Stage 2: Gloss-Free Sign Language Translation using HuggingFace Trainer API.
 # This stage performs end-to-end translation from pose sequences to text, using weights from Stage 1 (VLP) to initialize the encoder.
+import torch
+import torch.nn as nn
+from transformers import Trainer, TrainingArguments, AutoTokenizer, HfArgumentParser
+
 import numpy as np
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple
-
-import torch
-import torch.nn as nn
-from transformers import (
-    Trainer, TrainingArguments,
-    AutoTokenizer, HfArgumentParser,
-    EarlyStoppingCallback,
-)
-from transformers.trainer_utils import get_last_checkpoint
 
 import os
 import sys
@@ -31,6 +26,8 @@ rouge = evaluate.load('rouge')
 meteor = evaluate.load('meteor')
 cider = evaluate.load('Kamichanw/CIDEr')
 
+def is_bfloat16_supported(): # Checks if the current device supports bfloat16
+    return torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
 
 # ======================== Arguments ========================
 @dataclass
@@ -78,6 +75,7 @@ class CustomTrainingArguments(TrainingArguments):
     fp16: bool = field(default=not is_bfloat16_supported(), metadata={'help': 'Use mixed precision training if supported'})
     bf16: bool = field(default=is_bfloat16_supported(), metadata={'help': 'Use bfloat16 (if supported) instead of fp16 for mixed precision training'})
     learning_rate: float = field(default=5e-4, metadata={'help': 'Linear decay learning rate'})
+    lr_scheduler_type: str = field(default='cosine', metadata={'help': 'Learning rate scheduler type'})
     ddp_find_unused_parameters: bool = field(default=False, metadata={'help': 'Avoid DDP overhead if all parameters are used'})
     max_grad_norm: float = field(default=1.0, metadata={'help': 'Gradient clipping to avoid exploding gradients'})
     
@@ -97,9 +95,9 @@ class GenerationArguments:
 
 # ======================== Custom Trainer for Stage 2 Translation Training ========================
 class Stage2Trainer(Trainer):
-    def __init__(self, tokenizer, generation_args: GenerationArguments = None, **kwargs):
+    def __init__(self, trimmed_tokenizer, generation_args: GenerationArguments = None, **kwargs):
         super().__init__(**kwargs)
-        self.tokenizer = tokenizer
+        self.trimmed_tokenizer = trimmed_tokenizer
         self.generation_args = generation_args or GenerationArguments()
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -109,7 +107,7 @@ class Stage2Trainer(Trainer):
         labels = inputs['labels']
         
         # Extract tokens from labels
-        pad_token_id = self.tokenizer.pad_token_id
+        pad_token_id = self.trimmed_tokenizer.pad_token_id
         paragraph_tokens = torch.stack([l['paragraph_tokens'] for l in labels]).to(device)
         paragraph_attention_mask = (paragraph_tokens != pad_token_id).long()
         
@@ -125,7 +123,7 @@ class Stage2Trainer(Trainer):
         return loss
     
     
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = 'eval'): # Evaluate with BLEU score computation
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = 'test'): # Evaluate with BLEU score computation
         metrics = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix) # Run standard evaluation
         if eval_dataset is not None:
             self.model.eval()
@@ -144,18 +142,18 @@ class Stage2Trainer(Trainer):
                         pixel_mask=pixel_mask,
                         max_new_tokens=self.generation_args.max_new_tokens,
                         num_beams=self.generation_args.num_beams,
-                        decoder_start_token_id=self.tokenizer.lang_code_to_id.get('en_XX', self.tokenizer.bos_token_id),
+                        decoder_start_token_id=self.trimmed_tokenizer.lang_code_to_id.get('en_XX', self.trimmed_tokenizer.bos_token_id),
                     )
-                    pred_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                    pred_texts = self.trimmed_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                     predictions.extend(pred_texts)
                     
                     for l in labels: # Decode references
-                        ref_text = self.tokenizer.decode(l['paragraph_tokens'], skip_special_tokens=True)
+                        ref_text = self.trimmed_tokenizer.decode(l['paragraph_tokens'], skip_special_tokens=True)
                         references.append(ref_text)
             
             text_metrics = self.compute_text_metrics(predictions, references)
             for k, v in text_metrics.items():
-                metrics[f'{metric_key_prefix}_{k}'] = v
+                metrics[f'{metric_key_prefix}_para_{k}'] = v
         return metrics
     
     
@@ -200,16 +198,15 @@ def load_stage1_weights(model: GFSLT, checkpoint_path: str) -> GFSLT:
     for k, v in state_dict.items(): # Map Stage 1 encoder weights to Stage 2
         if 'base_module.model_images.backbone' in k: # The ImageCLIP backbone maps to GFSLT backbone
             new_k = k.replace('base_module.model_images.backbone', 'backbone')
+            new_state_dict[new_k] = v
         elif 'base_module.model_images.trans_encoder' in k: # Map to MBart encoder
             new_k = k.replace('base_module.model_images.trans_encoder', 'mbart.model.encoder')
-        new_state_dict[new_k] = v
+            new_state_dict[new_k] = v
     
     # Load MBart decoder weights from pretrained
     mbart_state = torch.load(
-        f'{model.mbart.config._name_or_path}/pytorch_model.bin' 
-        if hasattr(model.mbart.config, '_name_or_path') else None,
-        map_location='cpu'
-    ) if Path(f'{model.config.mbart_name}/pytorch_model.bin').exists() else {}
+        f'{model.config.mbart_name}/model.safetensors', map_location='cpu'
+    ) if Path(f'{model.config.mbart_name}/model.safetensors').exists() else {}
     
     for k, v in mbart_state.items():
         if 'decoder' in k and k not in new_state_dict:
@@ -231,14 +228,14 @@ def train_stage2(model_args: ModelArguments, data_args: DataArguments, training_
         min_events=data_args.min_events, max_events=data_args.max_events, max_window_tokens=data_args.max_window_tokens, 
         max_event_tokens=data_args.max_event_tokens, load_by=data_args.load_by, seed=training_args.seed
     )
-    val_dataset = DVCDataset(
-        split='val', tokenizer=tokenizer, pose_augment=False, stride_ratio=data_args.stride_ratio, 
+    test_dataset = DVCDataset(
+        split='test', tokenizer=tokenizer, pose_augment=False, stride_ratio=data_args.stride_ratio, 
         min_events=data_args.min_events, max_events=data_args.max_events, max_event_tokens=data_args.max_event_tokens, 
         max_window_tokens=data_args.max_window_tokens, load_by=data_args.load_by, seed=training_args.seed
     )
     if getattr(training_args, 'local_rank', -1) in (-1, 0): # Only log sizes on the main process to avoid clutter in DDP
         print(f'Train dataset: {len(train_dataset)} samples')
-        # print(f'Val dataset: {len(val_dataset)} samples')
+        print(f'Test dataset: {len(test_dataset)} samples')
         
     # Model Setup
     config = GFSLTConfig(
@@ -246,7 +243,6 @@ def train_stage2(model_args: ModelArguments, data_args: DataArguments, training_
         hidden_size=model_args.hidden_size,
         temporal_kernel=model_args.temporal_kernel,
         mbart_name=model_args.mbart_name,
-        noise_rate=model_args.noise_rate,
         label_smoothing=model_args.label_smoothing,
     )
     gfslt = GFSLT(config)
@@ -274,11 +270,9 @@ def train_stage2(model_args: ModelArguments, data_args: DataArguments, training_
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
         data_collator=trainer_collate_fn,
-        tokenizer=tokenizer,
+        trimmed_tokenizer=tokenizer,
         generation_args=generation_args,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
     
     # Training
@@ -292,15 +286,16 @@ def train_stage2(model_args: ModelArguments, data_args: DataArguments, training_
     # Evaluation
     if training_args.do_eval:
         print('Evaluating...')
-        metrics = trainer.evaluate()
-        trainer.log_metrics('eval', metrics)
-        trainer.save_metrics('eval', metrics)
+        model.load_state_dict(torch.load(os.path.join(training_args.output_dir, 'pytorch_model.bin')))
+        metrics = trainer.evaluate(test_dataset)
+        trainer.log_metrics('test', metrics)
+        trainer.save_metrics('test', metrics)
     return trainer
 
 
 # ======================== Entry Point ========================
 def main():
-    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, GenerationArguments))
+    parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments, GenerationArguments))
     
     if len(sys.argv) == 2 and sys.argv[1].endswith('.json'): # Parse from config file
         model_args, data_args, training_args, generation_args = parser.parse_json_file(json_file=sys.argv[1])
