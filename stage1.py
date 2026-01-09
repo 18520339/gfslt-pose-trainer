@@ -62,6 +62,7 @@ class CustomTrainingArguments(TrainingArguments):
     fp16: bool = field(default=not is_bfloat16_supported(), metadata={'help': 'Use mixed precision training if supported'})
     bf16: bool = field(default=is_bfloat16_supported(), metadata={'help': 'Use bfloat16 (if supported) instead of fp16 for mixed precision training'})
     learning_rate: float = field(default=5e-4, metadata={'help': 'Linear decay learning rate'})
+    lr_scheduler_type: str = field(default='cosine', metadata={'help': 'Learning rate scheduler type'})
     ddp_find_unused_parameters: bool = field(default=False, metadata={'help': 'Avoid DDP overhead if all parameters are used'})
     max_grad_norm: float = field(default=1.0, metadata={'help': 'Gradient clipping to avoid exploding gradients'})
     
