@@ -13,7 +13,7 @@ class CoSign1s(nn.Module):
         super().__init__()
         self.graph, A = {}, {}
         self.gcn_modules = {}
-        self.linear = nn.Sequential(nn.Linear(3, 64), nn.ReLU(inplace=True))
+        self.linear = nn.Sequential(nn.Linear(3, 64), nn.GELU())
 
         self.projections = {}
         for module in KPS_MODULES.keys():
@@ -30,7 +30,7 @@ class CoSign1s(nn.Module):
 
         self.gcn_modules = nn.ModuleDict(self.gcn_modules)
         self.projections = nn.ModuleDict(self.projections)
-        self.fusion = nn.Sequential(nn.Linear(final_dim * len(KPS_MODULES), hidden_size), nn.ReLU(inplace=True))
+        self.fusion = nn.Sequential(nn.Linear(final_dim * len(KPS_MODULES), hidden_size), nn.GELU())
         self.final_dim = final_dim
     
     
